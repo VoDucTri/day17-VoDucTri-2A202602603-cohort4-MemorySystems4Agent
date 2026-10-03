@@ -28,48 +28,83 @@ class BaselineAgent:
         self.config = config or load_config()
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
-
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
-        self.langchain_agent = None
+        self.langchain_agent = self._maybe_build_langchain_agent()
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
-
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
-
-        raise NotImplementedError
+        """Return the agent response and token accounting."""
+        if not self.force_offline and self.langchain_agent is not None:
+            try:
+                # Live mode via LangGraph / LangChain
+                config = {"configurable": {"thread_id": thread_id}}
+                result = self.langchain_agent.invoke(
+                    {"messages": [("user", message)]},
+                    config=config,
+                )
+                last_msg = result["messages"][-1]
+                response_text = getattr(last_msg, "content", str(last_msg))
+                session = self.sessions.setdefault(thread_id, SessionState())
+                prompt_tokens = sum(estimate_tokens(m["content"]) for m in session.messages) + estimate_tokens(message)
+                session.prompt_tokens_processed += prompt_tokens
+                resp_tokens = estimate_tokens(response_text)
+                session.token_usage += resp_tokens
+                session.messages.append({"role": "user", "content": message})
+                session.messages.append({"role": "assistant", "content": response_text})
+                return {
+                    "response": response_text,
+                    "tokens": resp_tokens,
+                    "prompt_tokens": prompt_tokens,
+                }
+            except Exception:
+                pass
+        return self._reply_offline(thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        """Return cumulative agent token count for one thread."""
+        return self.sessions.get(thread_id, SessionState()).token_usage
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        """Estimate how much prompt context this baseline kept processing."""
+        return self.sessions.get(thread_id, SessionState()).prompt_tokens_processed
 
     def compaction_count(self, thread_id: str) -> int:
-        # Baseline has no compact memory.
+        """Baseline has no compact memory."""
         return 0
 
     def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
+        """Implement deterministic offline behavior with strictly within-session memory."""
+        session = self.sessions.setdefault(thread_id, SessionState())
 
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
-        """
+        # Prompt context in baseline accumulates all raw messages in this session
+        prompt_tokens = sum(estimate_tokens(m["content"]) for m in session.messages) + estimate_tokens(message)
+        session.prompt_tokens_processed += prompt_tokens
 
-        raise NotImplementedError
+        session.messages.append({"role": "user", "content": message})
+
+        # Baseline forgets facts across threads
+        if len(session.messages) <= 1:
+            response = "Xin chào! Mình chưa có thông tin về bạn trong phiên làm việc này. Bạn có thể chia sẻ thêm thông tin để mình hỗ trợ nhé."
+        else:
+            response = "Đã nhận thông tin trong phiên làm việc này. Mình sẽ tiếp tục hỗ trợ bạn theo mạch trao đổi hiện tại."
+
+        resp_tokens = estimate_tokens(response)
+        session.token_usage += resp_tokens
+        session.messages.append({"role": "assistant", "content": response})
+
+        return {
+            "response": response,
+            "tokens": resp_tokens,
+            "prompt_tokens": prompt_tokens,
+        }
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
-
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
-        """
-
-        raise NotImplementedError
+        """Optionally wire LangGraph create_react_agent + MemorySaver."""
+        if self.force_offline or not self.config.model.api_key:
+            return None
+        try:
+            model = build_chat_model(self.config.model)
+            from langgraph.checkpoint.memory import MemorySaver
+            from langgraph.prebuilt import create_react_agent
+            checkpointer = MemorySaver()
+            return create_react_agent(model, tools=[], checkpointer=checkpointer)
+        except Exception:
+            return None
